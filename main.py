@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 import requests
 import time
-import psycopg2
+import random
 from psycopg2.pool import SimpleConnectionPool
 import re
 from ddgs import DDGS
@@ -34,11 +34,33 @@ MAX_IMAGE_HEIGHT = 800
 ALLOWED_IMAGE_TYPES = ['JPEG', 'PNG', 'JPG', 'WEBP']
 
 # Pull settings
-BATCH_SIZE = 30
-REST_MINUTES = 3
+BATCH_SIZE = 15
+REST_MINUTES = 5
 MAX_DAILY_FETCHES = 200
 
-# 🚫 IMAGE BLOCKLIST
+# 🏪 Trusted store sites for tier 1 search
+STORE_SITES = [
+    "site:plazavea.com.pe",
+    "site:tottus.com.pe",
+    "site:wong.pe",
+    "site:mercadolibre.com.pe",
+    "site:vivanda.com.pe",
+    "site:makro.com.pe",
+    "site:lacuracao.pe",
+    "site:linio.com.pe",
+    "site:ripley.com.pe",
+    "site:falabella.com.pe",
+]
+
+# 🚫 Bad sources to reject
+BAD_SOURCES = [
+    "mysourcedepot", "autozone", "hardware", "tools",
+    "vehicle", "motor", "engine", "belt", "mechanical",
+    "dental", "clinic", "teeth", "oatmeal", "workout",
+    "fitness", "gym", "gettyimages", "shutterstock",
+]
+
+# 🚫 IMAGE BLOCKLIST DOMAINS
 BLOCKLIST_DOMAINS = [
     "feriaemprendedora.com",
     "lagranbodega.com.pe",
@@ -64,13 +86,8 @@ BLOCKLIST_DOMAINS = [
 ]
 
 BLOCKLIST_PATTERNS = [
-    "logo",
-    "icon",
-    "avatar",
-    "favicon",
-    "placeholder",
-    "banner",
-    "thumbnail",
+    "logo", "icon", "avatar", "favicon",
+    "placeholder", "banner", "thumbnail",
 ]
 
 # 🔥 CATEGORIES
@@ -86,6 +103,13 @@ CATEGORIES = {
     "Alcohol": ["cerveza", "vino", "whisky", "ron", "pisco", "tres cruces", "heineken"],
     "Limpieza": ["tuinies", "gillete", "toallitas", "rexona", "desodorante", "axe", "dove", "suave", "noble", "elite", "servilleta", "papel", "jabon", "colgate", "pasta dental", "kolynos", "cepillo", "amaras", "h&s", "shampoo", "pantene", "ayudin", "nosotras", "gillette", "bahia", "floresta"],
     "Pilas": ["duracell"],
+}
+
+GENERIC_WORDS = {
+    "de", "la", "el", "los", "las", "con", "sin", "x",
+    "grs", "gr", "ml", "lt", "kg", "und", "unds", "pqte",
+    "pote", "pack", "pqt", "unid", "onzas", "oz", "the",
+    "and", "for", "with",
 }
 
 PLACEHOLDERS = {
@@ -138,7 +162,6 @@ def release_db_connection(conn):
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             name TEXT PRIMARY KEY,
@@ -148,7 +171,6 @@ def init_db():
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS product_images (
             name TEXT PRIMARY KEY,
@@ -161,12 +183,10 @@ def init_db():
             is_placeholder BOOLEAN DEFAULT FALSE
         )
     """)
-
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_product_images_last_fetch
         ON product_images(last_fetch)
     """)
-
     conn.commit()
     cur.close()
     release_db_connection(conn)
@@ -263,6 +283,10 @@ def get_brand_and_type(product_name):
 
     return brand, clean_name, category
 
+def get_meaningful_words(product_name):
+    words = product_name.lower().split()
+    return [w for w in words if w not in GENERIC_WORDS and len(w) > 2]
+
 
 # ─────────────────────────────────────────────
 # 🖼️ IMAGE FETCHING
@@ -279,9 +303,7 @@ def is_blocked_url(url):
     return False
 
 def image_matches_product(img_url, product_name):
-    """Block known bad image types — trust search query + blocklist for the rest"""
     url_lower = img_url.lower()
-
     bad_url_patterns = [
         "whale", "ballena", "wildlife", "nature", "animal",
         "landscape", "ocean", "sea-", "/sea/", "aerial",
@@ -289,10 +311,18 @@ def image_matches_product(img_url, product_name):
     ]
     for pattern in bad_url_patterns:
         if pattern in url_lower:
-            print(f"   🚫 Blocked bad image pattern: {pattern}")
+            print(f"   🚫 Blocked nature pattern in URL: {pattern}")
             return False
-
     return True
+
+def is_bad_result(img_url, title, source):
+    combined = f"{img_url} {title} {source}".lower()
+    return any(bad in combined for bad in BAD_SOURCES)
+
+def title_matches_product(title, meaningful_words):
+    title_lower = title.lower()
+    matches = sum(1 for w in meaningful_words if len(w) > 3 and w in title_lower)
+    return matches >= 1
 
 def validate_image_url(url):
     try:
@@ -329,46 +359,88 @@ def validate_image_url(url):
         print(f"   ⚠️ Image validation error: {str(e)[:50]}")
         return False, None, None, None
 
+def search_ddgs_images(query, product_name, meaningful_words, max_results=10):
+    """Run a single DDGS image search and return best matching URL"""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=max_results))
+            for result in results:
+                img_url = result.get('image', '')
+                title = result.get('title', '').lower()
+                source = result.get('source', '').lower()
+
+                if not img_url or not img_url.startswith("http"):
+                    continue
+                if is_blocked_url(img_url):
+                    continue
+                if not image_matches_product(img_url, product_name):
+                    continue
+                if is_bad_result(img_url, title, source):
+                    print(f"   🚫 Bad source: {source[:40]}")
+                    continue
+                if not title_matches_product(title, meaningful_words):
+                    print(f"   🚫 Title mismatch: {title[:40]}")
+                    continue
+
+                print(f"   ✅ Match: {img_url[:70]}")
+                return img_url
+    except Exception as e:
+        print(f"   ❌ DDGS error: {str(e)[:50]}")
+    return None
+
 def fetch_image(product_name):
     brand, clean_name, category = get_brand_and_type(product_name)
+    meaningful_words = get_meaningful_words(product_name)
 
-    # Remove overly generic words from search query
-    generic_words = {"agua", "bebida", "jugo", "drink", "producto", "tienda"}
-    clean_search = " ".join(
-        w for w in clean_name.split()
-        if w.lower() not in generic_words
-    ).strip() or clean_name  # fallback to full name if everything got stripped
+    quoted_brand = f'"{brand}"' if brand else ""
+    descriptors = " ".join(
+        w for w in meaningful_words
+        if brand and w != brand and len(w) > 3
+        or not brand and len(w) > 3
+    )[:40]
 
-    search_queries = []
+    print(f"\n🔍 Fetching image for: {product_name[:50]}")
+
+    # ── TIER 1: Search within trusted store sites ──────────────────
+    stores_to_try = random.sample(STORE_SITES, min(3, len(STORE_SITES)))
+    for store in stores_to_try:
+        if shutdown_event.is_set():
+            break
+        query = f"{quoted_brand} {descriptors} {store}".strip()
+        print(f"   🏪 Store search: {query[:60]}")
+        result = search_ddgs_images(query, product_name, meaningful_words, max_results=5)
+        if result:
+            return result
+        time.sleep(0.8)
+
+    # ── TIER 2: Broad web search with quoted brand ─────────────────
+    broad_queries = []
     if brand:
-        search_queries.append(f"{clean_search} envase producto")
-        search_queries.append(f"{brand} {category} botella")
+        broad_queries.append(f'{quoted_brand} {descriptors} producto envase')
+        broad_queries.append(f'{quoted_brand} {category} package')
     else:
-        search_queries.append(f"{clean_name} producto envase")
-        search_queries.append(f"{clean_name} comprar")
+        quoted_name = f'"{" ".join(meaningful_words[:3])}"'
+        broad_queries.append(f'{quoted_name} producto envase')
+        broad_queries.append(f'{quoted_name} package product')
 
-    print(f"🔍 Buscando imagen: {product_name[:50]}...")
-
-    for query in search_queries[:2]:
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.images(query, max_results=8))
-                for result in results:
-                    img_url = result.get('image')
-                    if not img_url or not img_url.startswith("http"):
-                        continue
-                    if is_blocked_url(img_url):
-                        continue
-                    if not image_matches_product(img_url, product_name):
-                        continue
-                    print(f"   ✅ Found: {img_url[:80]}...")
-                    return img_url
-        except Exception as e:
-            print(f"   ❌ DDGS error: {str(e)[:50]}")
-
+    for query in broad_queries:
+        if shutdown_event.is_set():
+            break
+        print(f"   🌐 Broad search: {query[:60]}")
+        result = search_ddgs_images(query, product_name, meaningful_words, max_results=8)
+        if result:
+            return result
         time.sleep(1)
 
-    print(f"   ⚠️ No match found for: {product_name[:50]}, using placeholder")
+    # ── TIER 3: Last resort — brand + category only ────────────────
+    if brand:
+        query = f'"{brand}" {category} producto'
+        print(f"   🔁 Last resort: {query[:60]}")
+        result = search_ddgs_images(query, product_name, meaningful_words, max_results=10)
+        if result:
+            return result
+
+    print(f"   ⚠️ No image found, using placeholder")
     return PLACEHOLDERS.get(category, PLACEHOLDERS["Other"])
 
 def can_fetch_today():
@@ -394,7 +466,6 @@ def increment_fetch_count():
 
 def sync_products_from_erp():
     session = requests.Session()
-
     auth_payload = {
         "jsonrpc": "2.0",
         "method": "call",
@@ -404,7 +475,6 @@ def sync_products_from_erp():
             "password": ERP_PASSWORD
         }
     }
-
     try:
         login_res = session.post(f"{BASE_URL}/web/session/authenticate", json=auth_payload)
         if "error" in login_res.json():
@@ -442,10 +512,8 @@ def sync_products_from_erp():
             break
 
     print(f"📦 Syncing {len(all_records)} products to local DB")
-
     conn = get_db_connection()
     cur = conn.cursor()
-
     for p in all_records:
         category = classify_product(p["name"])
         cur.execute("""
@@ -457,7 +525,6 @@ def sync_products_from_erp():
                 category = EXCLUDED.category,
                 last_seen = CURRENT_TIMESTAMP
         """, (p["name"], p["list_price"], p["qty_available"], category))
-
     conn.commit()
     cur.close()
     release_db_connection(conn)
@@ -471,7 +538,6 @@ def sync_products_from_erp():
 
 def fetch_and_enrich():
     sync_products_from_erp()
-
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -491,16 +557,9 @@ def fetch_and_enrich():
         cat = category or classify_product(name)
         if cat not in grouped:
             grouped[cat] = []
-
         if is_placeholder or not image or image.startswith("https://placehold.co"):
             image = PLACEHOLDERS.get(cat, PLACEHOLDERS["Other"])
-
-        grouped[cat].append({
-            "name": name,
-            "price": price,
-            "stock": stock,
-            "image": image
-        })
+        grouped[cat].append({"name": name, "price": price, "stock": stock, "image": image})
 
     return grouped
 
@@ -509,7 +568,6 @@ def refresh_cache_task(background=True):
         if cache["is_loading"]:
             return
         cache["is_loading"] = True
-
     try:
         print("🔄 Refreshing cache...")
         grouped = fetch_and_enrich()
@@ -530,9 +588,7 @@ def refresh_cache_task(background=True):
 # ─────────────────────────────────────────────
 
 def process_batch(missing_products):
-    """Process products in batches of BATCH_SIZE, resting REST_MINUTES between each"""
     global current_batch_count
-
     with batch_count_lock:
         current_batch_count = 0
 
@@ -541,12 +597,10 @@ def process_batch(missing_products):
     for product_name in missing_products:
         if shutdown_event.is_set():
             break
-
         if not can_fetch_today():
             print("⛔ Daily limit reached mid-batch, stopping.")
             break
 
-        # Rest after every BATCH_SIZE pulls
         with batch_count_lock:
             count = current_batch_count
 
@@ -557,7 +611,6 @@ def process_batch(missing_products):
                 break
             print("▶️  Resuming image fetching...")
 
-        print(f"\n🎯 Fetching: {product_name[:50]}...")
         img_url = fetch_image(product_name)
         increment_fetch_count()
 
@@ -569,7 +622,6 @@ def process_batch(missing_products):
                 save_cached_image(product_name, img_url, size_mb, width, height, is_placeholder=False)
                 print(f"   ✅ Saved: {product_name[:50]}")
                 success_count += 1
-
                 with cache_lock:
                     if cache["data"]:
                         for cat, products in cache["data"].items():
@@ -605,7 +657,6 @@ def get_all_missing_products():
 
 def continuous_image_worker():
     print("🖼️ Image worker started")
-
     while not shutdown_event.is_set():
         try:
             missing_products = get_all_missing_products()
@@ -644,7 +695,6 @@ def continuous_image_worker():
 
 def periodic_product_sync():
     print("🔄 Product sync worker started")
-
     while not shutdown_event.is_set():
         try:
             print("\n🔄 Periodic product sync...")
@@ -652,9 +702,7 @@ def periodic_product_sync():
             refresh_cache_task(background=False)
         except Exception as e:
             print(f"❌ Sync error: {e}")
-
         shutdown_event.wait(timeout=3600)
-
     print("🛑 Sync worker stopped")
 
 
@@ -704,19 +752,16 @@ def get_products():
     with cache_lock:
         data = cache["data"]
         is_loading = cache["is_loading"]
-
     if data:
         return data
     if is_loading:
         return {"message": "Products are loading, please refresh in a moment"}
-
     refresh_cache_task(background=True)
     return {"message": "Products are being loaded, please refresh in a moment"}
 
 @app.get("/products/status")
 def get_status():
     missing_count = get_missing_images_count()
-
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM products")
@@ -744,14 +789,13 @@ def get_status():
         "fetches_today": fetches_today,
         "daily_fetch_limit": MAX_DAILY_FETCHES,
         "current_batch_progress": f"{batch_progress % BATCH_SIZE}/{BATCH_SIZE}",
-        "rest_between_batches_minutes": REST_MINUTES
+        "rest_between_batches_minutes": REST_MINUTES,
     }
 
 @app.get("/search")
 def search(q: str):
     with cache_lock:
         data = cache["data"]
-
     if not data:
         return []
 
@@ -784,7 +828,6 @@ def fetch_missing():
     thread = threading.Thread(target=manual_fetch, daemon=True)
     thread.start()
     return {"message": "Missing images fetch initiated"}
-
 
 if __name__ == "__main__":
     import uvicorn
