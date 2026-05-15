@@ -34,6 +34,11 @@ MAX_IMAGE_WIDTH = 800
 MAX_IMAGE_HEIGHT = 800
 ALLOWED_IMAGE_TYPES = ['JPEG', 'PNG', 'JPG', 'WEBP']
 
+# Pull settings
+BATCH_SIZE = 15          # Pull 15 images then rest
+REST_MINUTES = 5         # Rest 5 minutes between batches
+MAX_DAILY_FETCHES = 200  # Daily cap
+
 # 🚫 IMAGE BLOCKLIST
 BLOCKLIST_DOMAINS = [
     "feriaemprendedora.com",
@@ -58,6 +63,8 @@ BLOCKLIST_PATTERNS = [
     "avatar",
     "favicon",
     "placeholder",
+    "banner",
+    "thumbnail",
 ]
 
 # 🔥 CATEGORIES
@@ -90,14 +97,17 @@ PLACEHOLDERS = {
 cache_lock = threading.Lock()
 cache = {"data": None, "timestamp": 0, "is_loading": False}
 
-# 🛑 Shutdown signal for background workers
+# 🛑 Shutdown signal
 shutdown_event = threading.Event()
 
-# Daily fetch limit to avoid rate limiting
-MAX_DAILY_FETCHES = 100
+# Daily fetch counter
 daily_fetch_count = 0
 daily_fetch_date = datetime.now().date()
 fetch_count_lock = threading.Lock()
+
+# Batch counter (resets every batch)
+current_batch_count = 0
+batch_count_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -262,6 +272,18 @@ def is_blocked_url(url):
             return True
     return False
 
+def image_matches_product(img_url, product_name):
+    """Check if image URL contains at least one meaningful product keyword"""
+    url_lower = img_url.lower()
+    product_words = product_name.lower().split()
+
+    filler = {"de", "la", "el", "los", "las", "con", "sin", "und", "pqte",
+              "pote", "x", "gr", "ml", "lt", "kg", "unid", "und", "pack"}
+    keywords = [w for w in product_words if w not in filler and len(w) > 2]
+
+    matches = sum(1 for word in keywords if word in url_lower)
+    return matches >= 1
+
 def validate_image_url(url):
     try:
         response = requests.get(url, timeout=15, stream=True)
@@ -302,35 +324,38 @@ def fetch_image(product_name):
 
     search_queries = []
     if brand:
-        search_queries.append(f"{clean_name} producto real")
-        search_queries.append(f"{clean_name} envase")
-        search_queries.append(f"{brand} {category}")
+        search_queries.append(f"{clean_name} snack peru")
+        search_queries.append(f"{clean_name} precio peru")
+        search_queries.append(f"{brand} {category} peru")
     else:
-        search_queries.append(f"{clean_name} producto")
+        search_queries.append(f"{clean_name} peru tienda")
 
     print(f"🔍 Buscando imagen: {product_name[:50]}...")
 
     for query in search_queries[:2]:
         try:
             with DDGS() as ddgs:
-                results = list(ddgs.images(query, max_results=5))
+                results = list(ddgs.images(query, max_results=8))
                 for result in results:
                     img_url = result.get('image')
                     if not img_url or not img_url.startswith("http"):
                         continue
                     if is_blocked_url(img_url):
                         continue
+                    if not image_matches_product(img_url, product_name):
+                        print(f"   ⚠️ Skipped irrelevant: {img_url[:60]}")
+                        continue
                     print(f"   ✅ Found: {img_url[:80]}...")
                     return img_url
         except Exception as e:
             print(f"   ❌ DDGS error: {str(e)[:50]}")
 
-        time.sleep(0.5)
+        time.sleep(1)
 
+    print(f"   ⚠️ No match found for: {product_name[:50]}, using placeholder")
     return PLACEHOLDERS.get(category, PLACEHOLDERS["Other"])
 
 def can_fetch_today():
-    """Check if we're under the daily fetch limit"""
     global daily_fetch_count, daily_fetch_date
     with fetch_count_lock:
         today = datetime.now().date()
@@ -340,9 +365,11 @@ def can_fetch_today():
         return daily_fetch_count < MAX_DAILY_FETCHES
 
 def increment_fetch_count():
-    global daily_fetch_count
+    global daily_fetch_count, current_batch_count
     with fetch_count_lock:
         daily_fetch_count += 1
+    with batch_count_lock:
+        current_batch_count += 1
 
 
 # ─────────────────────────────────────────────
@@ -486,29 +513,13 @@ def refresh_cache_task(background=True):
 # 🖼️ BACKGROUND IMAGE WORKER
 # ─────────────────────────────────────────────
 
-def process_missing_images():
-    if not can_fetch_today():
-        print(f"⛔ Daily fetch limit ({MAX_DAILY_FETCHES}) reached. Skipping until tomorrow.")
-        return 0
+def process_batch(missing_products):
+    """Process a single batch of up to BATCH_SIZE products"""
+    global current_batch_count
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.name
-        FROM products p
-        LEFT JOIN product_images pi ON p.name = pi.name
-        WHERE (pi.name IS NULL OR pi.is_placeholder = TRUE)
-        AND (pi.fetch_attempts IS NULL OR pi.fetch_attempts < 3)
-        LIMIT 10
-    """)
-    missing_products = [row[0] for row in cur.fetchall()]
-    cur.close()
-    release_db_connection(conn)
+    with batch_count_lock:
+        current_batch_count = 0
 
-    if not missing_products:
-        return 0
-
-    print(f"\n📸 Processing {len(missing_products)} missing images...")
     success_count = 0
 
     for product_name in missing_products:
@@ -518,6 +529,17 @@ def process_missing_images():
         if not can_fetch_today():
             print("⛔ Daily limit reached mid-batch, stopping.")
             break
+
+        # Check if we've hit the batch size limit
+        with batch_count_lock:
+            count = current_batch_count
+
+        if count >= BATCH_SIZE:
+            print(f"\n⏸️  Batch of {BATCH_SIZE} done — resting {REST_MINUTES} minutes...")
+            shutdown_event.wait(timeout=REST_MINUTES * 60)
+            print("▶️  Resuming image fetching...")
+            with batch_count_lock:
+                current_batch_count = 0
 
         print(f"\n🎯 Fetching: {product_name[:50]}...")
         img_url = fetch_image(product_name)
@@ -546,16 +568,35 @@ def process_missing_images():
             save_cached_image(product_name, PLACEHOLDERS["Other"], 0, 0, 0, is_placeholder=True)
             update_fetch_attempt(product_name)
 
+        # Small delay between individual requests
         time.sleep(2)
 
     return success_count
+
+def get_all_missing_products():
+    """Get all products missing images"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.name
+        FROM products p
+        LEFT JOIN product_images pi ON p.name = pi.name
+        WHERE (pi.name IS NULL OR pi.is_placeholder = TRUE)
+        AND (pi.fetch_attempts IS NULL OR pi.fetch_attempts < 3)
+        ORDER BY p.name
+    """)
+    products = [row[0] for row in cur.fetchall()]
+    cur.close()
+    release_db_connection(conn)
+    return products
 
 def continuous_image_worker():
     print("🖼️ Image worker started")
 
     while not shutdown_event.is_set():
         try:
-            missing_count = get_missing_images_count()
+            missing_products = get_all_missing_products()
+            missing_count = len(missing_products)
 
             if missing_count == 0:
                 print("✅ All images fetched. Sleeping for 1 hour.")
@@ -563,21 +604,25 @@ def continuous_image_worker():
                 continue
 
             if not can_fetch_today():
-                print(f"⛔ Daily limit reached. Sleeping until midnight...")
-                # Sleep until next day
+                print("⛔ Daily limit reached. Sleeping until midnight...")
                 now = datetime.now()
-                seconds_until_midnight = ((24 - now.hour - 1) * 3600) + ((60 - now.minute - 1) * 60) + (60 - now.second)
+                seconds_until_midnight = (
+                    ((24 - now.hour - 1) * 3600) +
+                    ((60 - now.minute - 1) * 60) +
+                    (60 - now.second)
+                )
                 shutdown_event.wait(timeout=seconds_until_midnight)
                 continue
 
-            print(f"\n🖼️ {missing_count} images missing, processing batch...")
-            processed = process_missing_images()
+            print(f"\n🖼️ {missing_count} images missing — starting batch processing...")
+            processed = process_batch(missing_products)
 
             if processed > 0:
+                print(f"✅ Batch complete: {processed} new images saved")
                 refresh_cache_task(background=False)
 
-            # Slower pace to avoid rate limiting
-            shutdown_event.wait(timeout=30)
+            # Short pause before checking again
+            shutdown_event.wait(timeout=10)
 
         except Exception as e:
             print(f"❌ Worker error: {e}")
@@ -607,7 +652,6 @@ def periodic_product_sync():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     print("🚀 Starting application...")
     init_db()
     sync_products_from_erp()
@@ -622,7 +666,6 @@ async def lifespan(app: FastAPI):
     print("✅ All background services started")
     yield
 
-    # Shutdown
     print("🛑 Shutting down background workers...")
     shutdown_event.set()
     image_thread.join(timeout=5)
@@ -677,6 +720,9 @@ def get_status():
     with fetch_count_lock:
         fetches_today = daily_fetch_count
 
+    with batch_count_lock:
+        batch_progress = current_batch_count
+
     return {
         "total_products": total_products,
         "missing_images": missing_count,
@@ -684,7 +730,9 @@ def get_status():
         "cache_loaded": cache_loaded,
         "is_loading": is_loading,
         "fetches_today": fetches_today,
-        "daily_fetch_limit": MAX_DAILY_FETCHES
+        "daily_fetch_limit": MAX_DAILY_FETCHES,
+        "current_batch_progress": f"{batch_progress}/{BATCH_SIZE}",
+        "rest_between_batches_minutes": REST_MINUTES
     }
 
 @app.get("/search")
@@ -716,7 +764,8 @@ def refresh_cache():
 def fetch_missing():
     def manual_fetch():
         print("🔍 Manual fetch triggered")
-        processed = process_missing_images()
+        missing = get_all_missing_products()
+        processed = process_batch(missing)
         refresh_cache_task(background=False)
         print(f"✅ Manual fetch done: {processed} images processed")
 
