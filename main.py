@@ -2,7 +2,6 @@ from fastapi import FastAPI
 import requests
 import time
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 import re
 from ddgs import DDGS
@@ -35,9 +34,9 @@ MAX_IMAGE_HEIGHT = 800
 ALLOWED_IMAGE_TYPES = ['JPEG', 'PNG', 'JPG', 'WEBP']
 
 # Pull settings
-BATCH_SIZE = 15          # Pull 15 images then rest
-REST_MINUTES = 5         # Rest 5 minutes between batches
-MAX_DAILY_FETCHES = 200  # Daily cap
+BATCH_SIZE = 30
+REST_MINUTES = 3
+MAX_DAILY_FETCHES = 200
 
 # 🚫 IMAGE BLOCKLIST
 BLOCKLIST_DOMAINS = [
@@ -55,6 +54,13 @@ BLOCKLIST_DOMAINS = [
     "lolliesnstuff.com.au",
     "a-static.mlcdn.com.br",
     "oriundo.pe",
+    "shutterstock.com",
+    "istockphoto.com",
+    "gettyimages.com",
+    "dreamstime.com",
+    "unsplash.com",
+    "pexels.com",
+    "alamy.com",
 ]
 
 BLOCKLIST_PATTERNS = [
@@ -105,7 +111,7 @@ daily_fetch_count = 0
 daily_fetch_date = datetime.now().date()
 fetch_count_lock = threading.Lock()
 
-# Batch counter (resets every batch)
+# Batch counter
 current_batch_count = 0
 batch_count_lock = threading.Lock()
 
@@ -273,16 +279,20 @@ def is_blocked_url(url):
     return False
 
 def image_matches_product(img_url, product_name):
-    """Check if image URL contains at least one meaningful product keyword"""
+    """Block known bad image types — trust search query + blocklist for the rest"""
     url_lower = img_url.lower()
-    product_words = product_name.lower().split()
 
-    filler = {"de", "la", "el", "los", "las", "con", "sin", "und", "pqte",
-              "pote", "x", "gr", "ml", "lt", "kg", "unid", "und", "pack"}
-    keywords = [w for w in product_words if w not in filler and len(w) > 2]
+    bad_url_patterns = [
+        "whale", "ballena", "wildlife", "nature", "animal",
+        "landscape", "ocean", "sea-", "/sea/", "aerial",
+        "forest", "mountain", "river", "sky", "cloud",
+    ]
+    for pattern in bad_url_patterns:
+        if pattern in url_lower:
+            print(f"   🚫 Blocked bad image pattern: {pattern}")
+            return False
 
-    matches = sum(1 for word in keywords if word in url_lower)
-    return matches >= 1
+    return True
 
 def validate_image_url(url):
     try:
@@ -322,13 +332,20 @@ def validate_image_url(url):
 def fetch_image(product_name):
     brand, clean_name, category = get_brand_and_type(product_name)
 
+    # Remove overly generic words from search query
+    generic_words = {"agua", "bebida", "jugo", "drink", "producto", "tienda"}
+    clean_search = " ".join(
+        w for w in clean_name.split()
+        if w.lower() not in generic_words
+    ).strip() or clean_name  # fallback to full name if everything got stripped
+
     search_queries = []
     if brand:
-        search_queries.append(f"{clean_name} snack peru")
-        search_queries.append(f"{clean_name} precio peru")
-        search_queries.append(f"{brand} {category} peru")
+        search_queries.append(f"{clean_search} envase producto")
+        search_queries.append(f"{brand} {category} botella")
     else:
-        search_queries.append(f"{clean_name} peru tienda")
+        search_queries.append(f"{clean_name} producto envase")
+        search_queries.append(f"{clean_name} comprar")
 
     print(f"🔍 Buscando imagen: {product_name[:50]}...")
 
@@ -343,7 +360,6 @@ def fetch_image(product_name):
                     if is_blocked_url(img_url):
                         continue
                     if not image_matches_product(img_url, product_name):
-                        print(f"   ⚠️ Skipped irrelevant: {img_url[:60]}")
                         continue
                     print(f"   ✅ Found: {img_url[:80]}...")
                     return img_url
@@ -514,7 +530,7 @@ def refresh_cache_task(background=True):
 # ─────────────────────────────────────────────
 
 def process_batch(missing_products):
-    """Process a single batch of up to BATCH_SIZE products"""
+    """Process products in batches of BATCH_SIZE, resting REST_MINUTES between each"""
     global current_batch_count
 
     with batch_count_lock:
@@ -530,16 +546,16 @@ def process_batch(missing_products):
             print("⛔ Daily limit reached mid-batch, stopping.")
             break
 
-        # Check if we've hit the batch size limit
+        # Rest after every BATCH_SIZE pulls
         with batch_count_lock:
             count = current_batch_count
 
-        if count >= BATCH_SIZE:
-            print(f"\n⏸️  Batch of {BATCH_SIZE} done — resting {REST_MINUTES} minutes...")
+        if count > 0 and count % BATCH_SIZE == 0:
+            print(f"\n⏸️  Pulled {BATCH_SIZE} images — resting {REST_MINUTES} minutes...")
             shutdown_event.wait(timeout=REST_MINUTES * 60)
+            if shutdown_event.is_set():
+                break
             print("▶️  Resuming image fetching...")
-            with batch_count_lock:
-                current_batch_count = 0
 
         print(f"\n🎯 Fetching: {product_name[:50]}...")
         img_url = fetch_image(product_name)
@@ -554,7 +570,6 @@ def process_batch(missing_products):
                 print(f"   ✅ Saved: {product_name[:50]}")
                 success_count += 1
 
-                # Update in-memory cache live
                 with cache_lock:
                     if cache["data"]:
                         for cat, products in cache["data"].items():
@@ -568,13 +583,11 @@ def process_batch(missing_products):
             save_cached_image(product_name, PLACEHOLDERS["Other"], 0, 0, 0, is_placeholder=True)
             update_fetch_attempt(product_name)
 
-        # Small delay between individual requests
         time.sleep(2)
 
     return success_count
 
 def get_all_missing_products():
-    """Get all products missing images"""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -621,7 +634,6 @@ def continuous_image_worker():
                 print(f"✅ Batch complete: {processed} new images saved")
                 refresh_cache_task(background=False)
 
-            # Short pause before checking again
             shutdown_event.wait(timeout=10)
 
         except Exception as e:
@@ -731,7 +743,7 @@ def get_status():
         "is_loading": is_loading,
         "fetches_today": fetches_today,
         "daily_fetch_limit": MAX_DAILY_FETCHES,
-        "current_batch_progress": f"{batch_progress}/{BATCH_SIZE}",
+        "current_batch_progress": f"{batch_progress % BATCH_SIZE}/{BATCH_SIZE}",
         "rest_between_batches_minutes": REST_MINUTES
     }
 
