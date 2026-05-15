@@ -35,7 +35,7 @@ ALLOWED_IMAGE_TYPES = ['JPEG', 'PNG', 'JPG', 'WEBP']
 
 # Pull settings
 BATCH_SIZE = 15
-REST_MINUTES = 5
+REST_MINUTES = 1
 MAX_DAILY_FETCHES = 200
 
 # 🏪 Store sites (fallback only)
