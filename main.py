@@ -34,11 +34,11 @@ MAX_IMAGE_HEIGHT = 800
 ALLOWED_IMAGE_TYPES = ['JPEG', 'PNG', 'JPG', 'WEBP']
 
 # Pull settings
-BATCH_SIZE = 30
-REST_MINUTES = 3
-MAX_DAILY_FETCHES = 300
+BATCH_SIZE = 15
+REST_MINUTES = 5
+MAX_DAILY_FETCHES = 200
 
-# 🏪 Trusted store sites for tier 1 search
+# 🏪 Store sites (fallback only)
 STORE_SITES = [
     "site:plazavea.com.pe",
     "site:tottus.com.pe",
@@ -46,18 +46,24 @@ STORE_SITES = [
     "site:mercadolibre.com.pe",
     "site:vivanda.com.pe",
     "site:makro.com.pe",
-    "site:lacuracao.pe",
     "site:linio.com.pe",
-    "site:ripley.com.pe",
     "site:falabella.com.pe",
 ]
 
-# 🚫 Bad sources to reject
+# 🚫 Bad sources
 BAD_SOURCES = [
     "mysourcedepot", "autozone", "hardware", "tools",
     "vehicle", "motor", "engine", "belt", "mechanical",
     "dental", "clinic", "teeth", "oatmeal", "workout",
     "fitness", "gym", "gettyimages", "shutterstock",
+    "eporner", "xvideos", "pornhub", "xhamster",
+    "redtube", "youporn", "tube8", "spankbang", "xnxx",
+]
+
+BAD_TITLE_WORDS = [
+    "porn", "sex", "xxx", "nude", "naked", "cosplay sex",
+    "wallpaper", "meme", "tattoo", "automotive", "car belt",
+    "hentai", "escort", "erotic",
 ]
 
 # 🚫 IMAGE BLOCKLIST DOMAINS
@@ -83,6 +89,16 @@ BLOCKLIST_DOMAINS = [
     "unsplash.com",
     "pexels.com",
     "alamy.com",
+    "home.ripley.com.pe",
+    "eporner.com",
+    "xvideos.com",
+    "pornhub.com",
+    "xhamster.com",
+    "redtube.com",
+    "youporn.com",
+    "tube8.com",
+    "spankbang.com",
+    "xnxx.com",
 ]
 
 BLOCKLIST_PATTERNS = [
@@ -98,7 +114,7 @@ CATEGORIES = {
     "Conservas": ["florida"],
     "Colageno": ["colageno"],
     "Chocolates": ["hershey", "kisses", "snickers", "reeses", "milky way", "twix", "iberica", "m&m", "pirucream", "kinder", "sublime", "triangulo", "princesa", "ferrero", "toblerone", "monfer", "trento"],
-    "Galletas": ["casino", "san jorge", "club social", "margarita", "chomp", "marquesitas", "tentacion", "glacitas", "soda", "field", "ritz", "integrakers", "costa", "animalitos", "black out", "coco nut", "municion", "fruta mixta", "rellenita", "galleta", "fibra", "nutri deli", "almoahada", "chaplin", "picaras", "chips ahoy", "morochas", "crackelet", "nik", "wafer", "cua cua", "oreo", "marquesita"],
+    "Galletas": ["casino", "agua line","san jorge", "club social", "margarita", "chomp", "marquesitas", "tentacion", "glacitas", "soda", "field", "ritz", "integrakers", "costa", "animalitos", "black out", "coco nut", "municion", "fruta mixta", "rellenita", "galleta", "fibra", "nutri deli", "almoahada", "chaplin", "picaras", "chips ahoy", "morochas", "crackelet", "nik", "wafer", "cua cua", "oreo", "marquesita"],
     "Golosinas": ["trolli", "trululu", "crismelo", "mentos", "skittles", "nerds", "starburst", "tic tac", "chicle", "bubb", "globo", "caramelo", "big ben", "truffle", "gum", "candy", "pop"],
     "Alcohol": ["cerveza", "vino", "whisky", "ron", "pisco", "tres cruces", "heineken"],
     "Limpieza": ["tuinies", "gillete", "toallitas", "rexona", "desodorante", "axe", "dove", "suave", "noble", "elite", "servilleta", "papel", "jabon", "colgate", "pasta dental", "kolynos", "cepillo", "amaras", "h&s", "shampoo", "pantene", "ayudin", "nosotras", "gillette", "bahia", "floresta"],
@@ -303,6 +319,7 @@ def is_blocked_url(url):
     return False
 
 def image_matches_product(img_url, product_name):
+    """Only block obvious nature/animal URLs"""
     url_lower = img_url.lower()
     bad_url_patterns = [
         "whale", "ballena", "wildlife", "nature", "animal",
@@ -311,18 +328,20 @@ def image_matches_product(img_url, product_name):
     ]
     for pattern in bad_url_patterns:
         if pattern in url_lower:
-            print(f"   🚫 Blocked nature pattern in URL: {pattern}")
+            print(f"   🚫 Bad URL pattern: {pattern}")
             return False
     return True
 
 def is_bad_result(img_url, title, source):
+    """Check source and title for bad content"""
     combined = f"{img_url} {title} {source}".lower()
-    return any(bad in combined for bad in BAD_SOURCES)
-
-def title_matches_product(title, meaningful_words):
-    title_lower = title.lower()
-    matches = sum(1 for w in meaningful_words if len(w) > 3 and w in title_lower)
-    return matches >= 1
+    # Check bad sources
+    if any(bad in combined for bad in BAD_SOURCES):
+        return True
+    # Check bad title words
+    if any(bad in title.lower() for bad in BAD_TITLE_WORDS):
+        return True
+    return False
 
 def validate_image_url(url):
     try:
@@ -359,11 +378,15 @@ def validate_image_url(url):
         print(f"   ⚠️ Image validation error: {str(e)[:50]}")
         return False, None, None, None
 
-def search_ddgs_images(query, product_name, meaningful_words, max_results=10):
-    """Run a single DDGS image search and return best matching URL"""
+def search_ddgs_images(query, product_name, meaningful_words, max_results=8):
+    """Run a DDGS image search with strict safesearch"""
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=max_results))
+            results = list(ddgs.images(
+                query,
+                max_results=max_results,
+                safesearch="strict"
+            ))
             for result in results:
                 img_url = result.get('image', '')
                 title = result.get('title', '').lower()
@@ -376,10 +399,7 @@ def search_ddgs_images(query, product_name, meaningful_words, max_results=10):
                 if not image_matches_product(img_url, product_name):
                     continue
                 if is_bad_result(img_url, title, source):
-                    print(f"   🚫 Bad source: {source[:40]}")
-                    continue
-                if not title_matches_product(title, meaningful_words):
-                    print(f"   🚫 Title mismatch: {title[:40]}")
+                    print(f"   🚫 Bad result: {source[:40]} | {title[:40]}")
                     continue
 
                 print(f"   ✅ Match: {img_url[:70]}")
@@ -392,49 +412,43 @@ def fetch_image(product_name):
     brand, clean_name, category = get_brand_and_type(product_name)
     meaningful_words = get_meaningful_words(product_name)
 
-    quoted_brand = f'"{brand}"' if brand else ""
-    descriptors = " ".join(
-        w for w in meaningful_words
-        if brand and w != brand and len(w) > 3
-        or not brand and len(w) > 3
-    )[:40]
+    # ── TIER 1: Simple queries like the old version ────────────────
+    # These worked well — keep them as primary
+    simple_queries = []
+    if brand:
+        simple_queries.append(f"{clean_name} producto real")
+        simple_queries.append(f"{clean_name} envase")
+        simple_queries.append(f"{brand} {category}")
+    else:
+        simple_queries.append(f"{clean_name} producto")
+        simple_queries.append(f"{clean_name} envase")
 
     print(f"\n🔍 Fetching image for: {product_name[:50]}")
 
-    # ── TIER 1: Search within trusted store sites ──────────────────
-    stores_to_try = random.sample(STORE_SITES, min(3, len(STORE_SITES)))
-    for store in stores_to_try:
+    for query in simple_queries[:2]:
         if shutdown_event.is_set():
             break
-        query = f"{quoted_brand} {descriptors} {store}".strip()
-        print(f"   🏪 Store search: {query[:60]}")
-        result = search_ddgs_images(query, product_name, meaningful_words, max_results=5)
-        if result:
-            return result
-        time.sleep(0.8)
-
-    # ── TIER 2: Broad web search with quoted brand ─────────────────
-    broad_queries = []
-    if brand:
-        broad_queries.append(f'{quoted_brand} {descriptors} producto envase')
-        broad_queries.append(f'{quoted_brand} {category} package')
-    else:
-        quoted_name = f'"{" ".join(meaningful_words[:3])}"'
-        broad_queries.append(f'{quoted_name} producto envase')
-        broad_queries.append(f'{quoted_name} package product')
-
-    for query in broad_queries:
-        if shutdown_event.is_set():
-            break
-        print(f"   🌐 Broad search: {query[:60]}")
+        print(f"   🔎 Simple: {query[:60]}")
         result = search_ddgs_images(query, product_name, meaningful_words, max_results=8)
         if result:
             return result
         time.sleep(1)
 
-    # ── TIER 3: Last resort — brand + category only ────────────────
+    # ── TIER 2: Store sites as fallback (no quoted brand) ──────────
+    stores_to_try = random.sample(STORE_SITES, min(2, len(STORE_SITES)))
+    for store in stores_to_try:
+        if shutdown_event.is_set():
+            break
+        query = f"{clean_name} {store}"
+        print(f"   🏪 Store: {query[:60]}")
+        result = search_ddgs_images(query, product_name, meaningful_words, max_results=5)
+        if result:
+            return result
+        time.sleep(0.8)
+
+    # ── TIER 3: Last resort — brand + category ─────────────────────
     if brand:
-        query = f'"{brand}" {category} producto'
+        query = f"{brand} {category} producto"
         print(f"   🔁 Last resort: {query[:60]}")
         result = search_ddgs_images(query, product_name, meaningful_words, max_results=10)
         if result:
@@ -598,7 +612,7 @@ def process_batch(missing_products):
         if shutdown_event.is_set():
             break
         if not can_fetch_today():
-            print("⛔ Daily limit reached mid-batch, stopping.")
+            print("⛔ Daily limit reached, stopping.")
             break
 
         with batch_count_lock:
@@ -609,7 +623,7 @@ def process_batch(missing_products):
             shutdown_event.wait(timeout=REST_MINUTES * 60)
             if shutdown_event.is_set():
                 break
-            print("▶️  Resuming image fetching...")
+            print("▶️  Resuming...")
 
         img_url = fetch_image(product_name)
         increment_fetch_count()
@@ -828,6 +842,21 @@ def fetch_missing():
     thread = threading.Thread(target=manual_fetch, daemon=True)
     thread.start()
     return {"message": "Missing images fetch initiated"}
+
+@app.post("/reset-placeholders")
+def reset_placeholders():
+    """Reset all placeholders so worker re-fetches them"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE product_images
+        SET is_placeholder = TRUE, fetch_attempts = 0
+        WHERE is_placeholder = TRUE OR image LIKE '%placehold.co%'
+    """)
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+    return {"message": "Placeholders reset, worker will re-fetch"}
 
 if __name__ == "__main__":
     import uvicorn
