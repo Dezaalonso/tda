@@ -1,4 +1,5 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Header
+from fastapi.staticfiles import StaticFiles
 import requests
 import time
 import random
@@ -10,9 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 from PIL import Image
 import os
+import shutil
 import threading
 from datetime import datetime
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
+from typing import Optional
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ⚙️ CONFIG
@@ -26,17 +32,23 @@ DB_CONFIG = {
 }
 ERP_LOGIN = os.getenv("ERP_LOGIN", "armando@dacom.com")
 ERP_PASSWORD = os.getenv("ERP_PASSWORD", "004795322")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "changeme123")
 
 # Image validation settings
 MAX_IMAGE_SIZE_MB = 2
 MAX_IMAGE_WIDTH = 800
 MAX_IMAGE_HEIGHT = 800
 ALLOWED_IMAGE_TYPES = ['JPEG', 'PNG', 'JPG', 'WEBP']
+ALLOWED_CONTENT_TYPES = ["image/jpeg", "image/png", "image/webp", "image/jpg"]
 
 # Pull settings
-BATCH_SIZE = 15
-REST_MINUTES = 1
-MAX_DAILY_FETCHES = 200
+BATCH_SIZE = 30
+REST_MINUTES = 2
+MAX_DAILY_FETCHES = 300
+
+# Upload directory
+IMAGES_DIR = "product_images_upload"
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # 🏪 Store sites (fallback only)
 STORE_SITES = [
@@ -108,14 +120,14 @@ BLOCKLIST_PATTERNS = [
 
 # 🔥 CATEGORIES
 CATEGORIES = {
+    "Drinks": ["coca", "pepsi", "fanta", "jugo", "agua", "bebida", "oriundo", "inca", "sprite", "dr. pepper", "starbucks", "crush", "frumas", "frappuccino"],
     "Snacks": ["lays", "snax", "chicharron", "cheetos", "tortees", "cuates", "mexi", "prezlet", "snyder", "alfajores arequipeños", "cereal", "pringles", "act", "combos", "nachos", "atomico"],
     "Salsas": ["spitze"],
     "Conservas": ["florida"],
     "Colageno": ["colageno"],
     "Chocolates": ["hershey", "kisses", "snickers", "reeses", "milky way", "twix", "iberica", "m&m", "pirucream", "kinder", "sublime", "triangulo", "princesa", "ferrero", "toblerone", "monfer", "trento"],
-    "Galletas": ["casino", "agua line","san jorge", "club social", "margarita", "chomp", "marquesitas", "tentacion", "glacitas", "soda", "field", "ritz", "integrakers", "costa", "animalitos", "black out", "coco nut", "municion", "fruta mixta", "rellenita", "galleta", "fibra", "nutri deli", "almoahada", "chaplin", "picaras", "chips ahoy", "morochas", "crackelet", "nik", "wafer", "cua cua", "oreo", "marquesita"],
+    "Galletas": ["casino", "san jorge", "club social", "margarita", "chomp", "marquesitas", "tentacion", "glacitas", "soda", "field", "ritz", "integrakers", "costa", "animalitos", "black out", "coco nut", "municion", "fruta mixta", "rellenita", "galleta", "fibra", "nutri deli", "almoahada", "chaplin", "picaras", "chips ahoy", "morochas", "crackelet", "nik", "wafer", "cua cua", "oreo", "marquesita"],
     "Golosinas": ["trolli", "trululu", "crismelo", "mentos", "skittles", "nerds", "starburst", "tic tac", "chicle", "bubb", "globo", "caramelo", "big ben", "truffle", "gum", "candy", "pop"],
-    "Drinks": ["coca", "pepsi", "fanta", "jugo", "agua", "bebida", "oriundo", "inca", "sprite", "dr. pepper", "starbucks", "crush", "frumas", "frappuccino"],
     "Alcohol": ["cerveza", "vino", "whisky", "ron", "pisco", "tres cruces", "heineken"],
     "Limpieza": ["tuinies", "gillete", "toallitas", "rexona", "desodorante", "axe", "dove", "suave", "noble", "elite", "servilleta", "papel", "jabon", "colgate", "pasta dental", "kolynos", "cepillo", "amaras", "h&s", "shampoo", "pantene", "ayudin", "nosotras", "gillette", "bahia", "floresta"],
     "Pilas": ["duracell"],
@@ -178,15 +190,18 @@ def release_db_connection(conn):
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             name TEXT PRIMARY KEY,
             list_price REAL,
             qty_available REAL,
             category TEXT,
+            custom_group TEXT,
             last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS product_images (
             name TEXT PRIMARY KEY,
@@ -196,17 +211,57 @@ def init_db():
             height INTEGER,
             last_fetch TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             fetch_attempts INTEGER DEFAULT 0,
-            is_placeholder BOOLEAN DEFAULT FALSE
+            is_placeholder BOOLEAN DEFAULT FALSE,
+            is_manual BOOLEAN DEFAULT FALSE
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS offers (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            product_name TEXT,
+            discount_percent REAL,
+            active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+    """)
+
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_product_images_last_fetch
         ON product_images(last_fetch)
     """)
+
+    # Add columns if they don't exist (for existing DBs)
+    try:
+        cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS custom_group TEXT")
+        cur.execute("ALTER TABLE product_images ADD COLUMN IF NOT EXISTS is_manual BOOLEAN DEFAULT FALSE")
+    except Exception:
+        pass
+
     conn.commit()
     cur.close()
     release_db_connection(conn)
     print("✅ Database initialized")
+
+
+# ─────────────────────────────────────────────
+# 🔐 ADMIN AUTH
+# ─────────────────────────────────────────────
+
+def verify_admin(x_api_key: str = Header(...)):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ─────────────────────────────────────────────
@@ -222,12 +277,12 @@ def get_cached_image(name):
     release_db_connection(conn)
     return row[0] if row and not row[1] else None
 
-def save_cached_image(name, image_url, image_size=None, width=None, height=None, is_placeholder=False):
+def save_cached_image(name, image_url, image_size=None, width=None, height=None, is_placeholder=False, is_manual=False):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO product_images (name, image, image_size, width, height, last_fetch, fetch_attempts, is_placeholder)
-        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, 1, %s)
+        INSERT INTO product_images (name, image, image_size, width, height, last_fetch, fetch_attempts, is_placeholder, is_manual)
+        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, 1, %s, %s)
         ON CONFLICT (name) DO UPDATE SET
             image = EXCLUDED.image,
             image_size = EXCLUDED.image_size,
@@ -235,8 +290,9 @@ def save_cached_image(name, image_url, image_size=None, width=None, height=None,
             height = EXCLUDED.height,
             last_fetch = CURRENT_TIMESTAMP,
             fetch_attempts = product_images.fetch_attempts + 1,
-            is_placeholder = EXCLUDED.is_placeholder
-    """, (name, image_url, image_size, width, height, is_placeholder))
+            is_placeholder = EXCLUDED.is_placeholder,
+            is_manual = EXCLUDED.is_manual
+    """, (name, image_url, image_size, width, height, is_placeholder, is_manual))
     conn.commit()
     cur.close()
     release_db_connection(conn)
@@ -262,12 +318,51 @@ def get_missing_images_count():
         SELECT COUNT(*)
         FROM products p
         LEFT JOIN product_images pi ON p.name = pi.name
-        WHERE pi.name IS NULL OR pi.is_placeholder = TRUE
+        WHERE (pi.name IS NULL OR pi.is_placeholder = TRUE)
+        AND (pi.is_manual IS NULL OR pi.is_manual = FALSE)
     """)
     count = cur.fetchone()[0]
     cur.close()
     release_db_connection(conn)
     return count
+
+def update_live_cache_image(product_name, image_url):
+    """Update image in live cache without full refresh"""
+    with cache_lock:
+        if cache["data"]:
+            for cat, products in cache["data"].items():
+                for p in products:
+                    if p["name"] == product_name:
+                        p["image"] = image_url
+                        return
+
+
+# ─────────────────────────────────────────────
+# ⚙️ SETTINGS HELPERS
+# ─────────────────────────────────────────────
+
+def get_setting(key, default=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+    row = cur.fetchone()
+    cur.close()
+    release_db_connection(conn)
+    return row[0] if row else default
+
+def save_setting(key, value):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO settings (key, value, updated_at)
+        VALUES (%s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (key) DO UPDATE SET
+            value = EXCLUDED.value,
+            updated_at = CURRENT_TIMESTAMP
+    """, (key, value))
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
 
 
 # ─────────────────────────────────────────────
@@ -319,7 +414,6 @@ def is_blocked_url(url):
     return False
 
 def image_matches_product(img_url, product_name):
-    """Only block obvious nature/animal URLs"""
     url_lower = img_url.lower()
     bad_url_patterns = [
         "whale", "ballena", "wildlife", "nature", "animal",
@@ -328,17 +422,13 @@ def image_matches_product(img_url, product_name):
     ]
     for pattern in bad_url_patterns:
         if pattern in url_lower:
-            print(f"   🚫 Bad URL pattern: {pattern}")
             return False
     return True
 
 def is_bad_result(img_url, title, source):
-    """Check source and title for bad content"""
     combined = f"{img_url} {title} {source}".lower()
-    # Check bad sources
     if any(bad in combined for bad in BAD_SOURCES):
         return True
-    # Check bad title words
     if any(bad in title.lower() for bad in BAD_TITLE_WORDS):
         return True
     return False
@@ -379,7 +469,6 @@ def validate_image_url(url):
         return False, None, None, None
 
 def search_ddgs_images(query, product_name, meaningful_words, max_results=8):
-    """Run a DDGS image search with strict safesearch"""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.images(
@@ -412,8 +501,6 @@ def fetch_image(product_name):
     brand, clean_name, category = get_brand_and_type(product_name)
     meaningful_words = get_meaningful_words(product_name)
 
-    # ── TIER 1: Simple queries like the old version ────────────────
-    # These worked well — keep them as primary
     simple_queries = []
     if brand:
         simple_queries.append(f"{clean_name} producto real")
@@ -434,7 +521,6 @@ def fetch_image(product_name):
             return result
         time.sleep(1)
 
-    # ── TIER 2: Store sites as fallback (no quoted brand) ──────────
     stores_to_try = random.sample(STORE_SITES, min(2, len(STORE_SITES)))
     for store in stores_to_try:
         if shutdown_event.is_set():
@@ -446,7 +532,6 @@ def fetch_image(product_name):
             return result
         time.sleep(0.8)
 
-    # ── TIER 3: Last resort — brand + category ─────────────────────
     if brand:
         query = f"{brand} {category} producto"
         print(f"   🔁 Last resort: {query[:60]}")
@@ -555,9 +640,10 @@ def fetch_and_enrich():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT p.name, p.list_price, p.qty_available, p.category,
-               COALESCE(pi.image, 'https://placehold.co/400x400/gray/white?text=Cargando...') as image,
-               pi.is_placeholder
+        SELECT p.name, p.list_price, p.qty_available,
+               COALESCE(p.custom_group, p.category) as effective_category,
+               p.category as original_category,
+               pi.image, pi.is_placeholder
         FROM products p
         LEFT JOIN product_images pi ON p.name = pi.name
         ORDER BY p.name
@@ -567,13 +653,19 @@ def fetch_and_enrich():
     release_db_connection(conn)
 
     grouped = {}
-    for name, price, stock, category, image, is_placeholder in products:
-        cat = category or classify_product(name)
+    for name, price, stock, effective_category, original_category, image, is_placeholder in products:
+        cat = effective_category or classify_product(name)
         if cat not in grouped:
             grouped[cat] = []
         if is_placeholder or not image or image.startswith("https://placehold.co"):
-            image = PLACEHOLDERS.get(cat, PLACEHOLDERS["Other"])
-        grouped[cat].append({"name": name, "price": price, "stock": stock, "image": image})
+            image = PLACEHOLDERS.get(original_category, PLACEHOLDERS["Other"])
+        grouped[cat].append({
+            "name": name,
+            "price": price,
+            "stock": stock,
+            "image": image,
+            "original_category": original_category
+        })
 
     return grouped
 
@@ -636,12 +728,7 @@ def process_batch(missing_products):
                 save_cached_image(product_name, img_url, size_mb, width, height, is_placeholder=False)
                 print(f"   ✅ Saved: {product_name[:50]}")
                 success_count += 1
-                with cache_lock:
-                    if cache["data"]:
-                        for cat, products in cache["data"].items():
-                            for product in products:
-                                if product["name"] == product_name:
-                                    product["image"] = img_url
+                update_live_cache_image(product_name, img_url)
             else:
                 save_cached_image(product_name, PLACEHOLDERS["Other"], 0, 0, 0, is_placeholder=True)
                 update_fetch_attempt(product_name)
@@ -661,6 +748,7 @@ def get_all_missing_products():
         FROM products p
         LEFT JOIN product_images pi ON p.name = pi.name
         WHERE (pi.name IS NULL OR pi.is_placeholder = TRUE)
+        AND (pi.is_manual IS NULL OR pi.is_manual = FALSE)
         AND (pi.fetch_attempts IS NULL OR pi.fetch_attempts < 3)
         ORDER BY p.name
     """)
@@ -756,9 +844,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.mount("/static/product-images", StaticFiles(directory=IMAGES_DIR), name="product-images")
+
 
 # ─────────────────────────────────────────────
-# 📡 ENDPOINTS
+# 📡 PUBLIC ENDPOINTS
 # ─────────────────────────────────────────────
 
 @app.get("/products")
@@ -824,6 +914,327 @@ def search(q: str):
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:20]
 
+@app.get("/offers")
+def get_offers():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, title, description, product_name, discount_percent, active, created_at, expires_at
+        FROM offers
+        WHERE active = TRUE
+        AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+        ORDER BY created_at DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    release_db_connection(conn)
+    return [
+        {
+            "id": r[0], "title": r[1], "description": r[2],
+            "product_name": r[3], "discount_percent": r[4],
+            "active": r[5], "created_at": r[6], "expires_at": r[7]
+        }
+        for r in rows
+    ]
+
+@app.get("/contact")
+def get_contact():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM settings WHERE key LIKE 'contact_%'")
+    rows = cur.fetchall()
+    cur.close()
+    release_db_connection(conn)
+    return {row[0].replace("contact_", ""): row[1] for row in rows}
+
+@app.get("/groups")
+def get_groups():
+    """Get all available groups including custom ones"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT COALESCE(custom_group, category) as group_name
+        FROM products
+        ORDER BY group_name
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    release_db_connection(conn)
+    return [row[0] for row in rows]
+
+
+# ─────────────────────────────────────────────
+# 🔐 ADMIN ENDPOINTS
+# ─────────────────────────────────────────────
+
+@app.get("/admin/products")
+def admin_get_products(key: str = Depends(verify_admin)):
+    """Get all products flat for admin table"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.name, p.list_price, p.qty_available, p.category,
+               p.custom_group, pi.image, pi.is_placeholder,
+               pi.fetch_attempts, pi.is_manual, pi.last_fetch
+        FROM products p
+        LEFT JOIN product_images pi ON p.name = pi.name
+        ORDER BY p.name
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    release_db_connection(conn)
+    return [
+        {
+            "name": r[0], "price": r[1], "stock": r[2],
+            "category": r[3], "custom_group": r[4],
+            "image": r[5], "is_placeholder": r[6],
+            "fetch_attempts": r[7], "is_manual": r[8],
+            "last_fetch": r[9]
+        }
+        for r in rows
+    ]
+
+@app.post("/admin/upload-image")
+async def upload_product_image(
+    name: str,  # query param instead of path param
+    file: UploadFile = File(...),
+    key: str = Depends(verify_admin)
+):
+    """Upload a local image for a product"""
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(400, f"Only {ALLOWED_CONTENT_TYPES} allowed")
+
+    # Read and validate image
+    contents = await file.read()
+    if len(contents) > MAX_IMAGE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(400, f"Image too large, max {MAX_IMAGE_SIZE_MB}MB")
+
+    try:
+        img = Image.open(BytesIO(contents))
+        width, height = img.size
+        if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+            raise HTTPException(400, f"Image too large, max {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}px")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(400, "Invalid image file")
+
+    # Save to disk
+    ext = file.filename.split(".")[-1].lower()
+    safe_name = re.sub(r'[^a-z0-9]', '_', name.lower())
+    filename = f"{safe_name}.{ext}"
+    filepath = os.path.join(IMAGES_DIR, filename)
+
+    with open(filepath, "wb") as f:
+        f.write(contents)
+
+    size_mb = len(contents) / (1024 * 1024) 
+
+    # ✅ Save FULL URL, not relative path
+    base_url = os.getenv("BASE_SERVER_URL", "http://localhost:8000")
+    image_url = f"{base_url}/static/product-images/{filename}"
+
+    save_cached_image(name, image_url, size_mb, width, height, is_placeholder=False, is_manual=True)
+    update_live_cache_image(name, image_url)
+
+    return {"message": "Image uploaded", "image_url": image_url}
+
+@app.post("/admin/products/{name}/group")
+def admin_set_group(name: str, body: dict, key: str = Depends(verify_admin)):
+    """Move product to a custom group"""
+    group = body.get("group", "").strip()
+    if not group:
+        raise HTTPException(400, "group is required")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE products SET custom_group = %s WHERE name = %s",
+        (group, name)
+    )
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+
+    # Refresh cache so frontend sees new group immediately
+    thread = threading.Thread(target=refresh_cache_task, args=(False,), daemon=True)
+    thread.start()
+
+    return {"message": f"{name} moved to group '{group}'"}
+
+@app.delete("/admin/products/{name}/group")
+def admin_reset_group(name: str, key: str = Depends(verify_admin)):
+    """Reset product back to its original category"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE products SET custom_group = NULL WHERE name = %s",
+        (name,)
+    )
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+
+    thread = threading.Thread(target=refresh_cache_task, args=(False,), daemon=True)
+    thread.start()
+
+    return {"message": f"{name} reset to original category"}
+
+# ── Contact Info ───────────────────────────────
+
+class ContactInfo(BaseModel):
+    phone: Optional[str] = None
+    whatsapp: Optional[str] = None
+    email: Optional[str] = None
+    address: Optional[str] = None
+    instagram: Optional[str] = None
+    facebook: Optional[str] = None
+    hours: Optional[str] = None
+
+@app.get("/admin/contact")
+def admin_get_contact(key: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM settings WHERE key LIKE 'contact_%'")
+    rows = cur.fetchall()
+    cur.close()
+    release_db_connection(conn)
+    return {row[0].replace("contact_", ""): row[1] for row in rows}
+
+@app.post("/admin/contact")
+def admin_save_contact(contact: ContactInfo, key: str = Depends(verify_admin)):
+    """Save contact information"""
+    fields = contact.dict(exclude_none=True)
+    for field, value in fields.items():
+        save_setting(f"contact_{field}", value)
+    return {"message": "Contact info saved", "updated": list(fields.keys())}
+
+# ── Offers ────────────────────────────────────
+
+class OfferCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    product_name: Optional[str] = None
+    discount_percent: Optional[float] = None
+    expires_at: Optional[str] = None
+
+@app.get("/admin/offers")
+def admin_get_offers(key: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, title, description, product_name,
+               discount_percent, active, created_at, expires_at
+        FROM offers ORDER BY created_at DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    release_db_connection(conn)
+    return [
+        {
+            "id": r[0], "title": r[1], "description": r[2],
+            "product_name": r[3], "discount_percent": r[4],
+            "active": r[5], "created_at": r[6], "expires_at": r[7]
+        }
+        for r in rows
+    ]
+
+@app.post("/admin/offers")
+def admin_create_offer(offer: OfferCreate, key: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO offers (title, description, product_name, discount_percent, expires_at)
+        VALUES (%s, %s, %s, %s, %s) RETURNING id
+    """, (offer.title, offer.description, offer.product_name,
+          offer.discount_percent, offer.expires_at))
+    new_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+    return {"message": "Offer created", "id": new_id}
+
+@app.patch("/admin/offers/{offer_id}")
+def admin_toggle_offer(offer_id: int, body: dict, key: str = Depends(verify_admin)):
+    active = body.get("active")
+    if active is None:
+        raise HTTPException(400, "active field required")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE offers SET active = %s WHERE id = %s", (active, offer_id))
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+    return {"message": f"Offer {'activated' if active else 'deactivated'}"}
+
+@app.delete("/admin/offers/{offer_id}")
+def admin_delete_offer(offer_id: int, key: str = Depends(verify_admin)):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM offers WHERE id = %s", (offer_id,))
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+    return {"message": "Offer deleted"}
+
+# ── Misc Admin ────────────────────────────────
+
+@app.post("/admin/refresh")
+def admin_refresh(key: str = Depends(verify_admin)):
+    thread = threading.Thread(target=refresh_cache_task, args=(False,), daemon=True)
+    thread.start()
+    return {"message": "Cache refresh initiated"}
+
+@app.post("/admin/reset-placeholders")
+def admin_reset_placeholders(key: str = Depends(verify_admin)):
+    """Reset all auto-fetched placeholders so worker re-fetches them"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE product_images
+        SET is_placeholder = TRUE, fetch_attempts = 0
+        WHERE (is_placeholder = TRUE OR image LIKE '%placehold.co%')
+        AND (is_manual IS NULL OR is_manual = FALSE)
+    """)
+    conn.commit()
+    cur.close()
+    release_db_connection(conn)
+    return {"message": "Placeholders reset, worker will re-fetch"}
+
+@app.get("/admin/status")
+def admin_status(key: str = Depends(verify_admin)):
+    missing_count = get_missing_images_count()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM products")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM product_images WHERE is_manual = TRUE")
+    manual = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM product_images WHERE is_placeholder = FALSE AND is_manual = FALSE")
+    auto = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM offers WHERE active = TRUE")
+    active_offers = cur.fetchone()[0]
+    cur.close()
+    release_db_connection(conn)
+
+    with fetch_count_lock:
+        fetches_today = daily_fetch_count
+
+    return {
+        "total_products": total,
+        "missing_images": missing_count,
+        "manual_images": manual,
+        "auto_images": auto,
+        "active_offers": active_offers,
+        "fetches_today": fetches_today,
+        "daily_fetch_limit": MAX_DAILY_FETCHES,
+    }
+
+
+# ─────────────────────────────────────────────
+# PUBLIC UTILS
+# ─────────────────────────────────────────────
+
 @app.post("/refresh")
 def refresh_cache():
     thread = threading.Thread(target=refresh_cache_task, args=(False,), daemon=True)
@@ -833,30 +1244,14 @@ def refresh_cache():
 @app.post("/fetch-missing")
 def fetch_missing():
     def manual_fetch():
-        print("🔍 Manual fetch triggered")
         missing = get_all_missing_products()
         processed = process_batch(missing)
         refresh_cache_task(background=False)
         print(f"✅ Manual fetch done: {processed} images processed")
-
     thread = threading.Thread(target=manual_fetch, daemon=True)
     thread.start()
     return {"message": "Missing images fetch initiated"}
 
-@app.post("/reset-placeholders")
-def reset_placeholders():
-    """Reset all placeholders so worker re-fetches them"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE product_images
-        SET is_placeholder = TRUE, fetch_attempts = 0
-        WHERE is_placeholder = TRUE OR image LIKE '%placehold.co%'
-    """)
-    conn.commit()
-    cur.close()
-    release_db_connection(conn)
-    return {"message": "Placeholders reset, worker will re-fetch"}
 
 if __name__ == "__main__":
     import uvicorn
