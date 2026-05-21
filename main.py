@@ -44,7 +44,7 @@ ALLOWED_CONTENT_TYPES = ["image/jpeg", "image/png", "image/webp", "image/jpg"]
 # Pull settings
 BATCH_SIZE = 30
 REST_MINUTES = 2
-MAX_DAILY_FETCHES = 300
+MAX_DAILY_FETCHES = 600
 
 # Upload directory
 IMAGES_DIR = "product_images_upload"
@@ -262,7 +262,6 @@ def init_db():
 def verify_admin(x_api_key: str = Header(...)):
     if x_api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
 
 # ─────────────────────────────────────────────
 # 🖼️ IMAGE CACHE HELPERS
