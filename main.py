@@ -837,12 +837,14 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_origins=[
+        "https://dacomstore.com",
+        "https://admin.dacomstore.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.mount("/static/product-images", StaticFiles(directory=IMAGES_DIR), name="product-images")
 
 
