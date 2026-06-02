@@ -610,8 +610,18 @@ def sync_products_from_erp():
             break
 
     print(f"📦 Syncing {len(all_records)} products to local DB")
+
+    # Safety guard
+    if len(all_records) < 10:
+        print(f"⚠️ Only {len(all_records)} products returned from ERP, skipping sync to avoid data loss")
+        return False
+
     conn = get_db_connection()
     cur = conn.cursor()
+
+    erp_names = {p["name"] for p in all_records}
+
+    # Upsert all current ERP products
     for p in all_records:
         category = classify_product(p["name"])
         cur.execute("""
@@ -623,12 +633,31 @@ def sync_products_from_erp():
                 category = EXCLUDED.category,
                 last_seen = CURRENT_TIMESTAMP
         """, (p["name"], p["list_price"], p["qty_available"], category))
+
+    # Delete products no longer in ERP
+    cur.execute("""
+        DELETE FROM products
+        WHERE name NOT IN %s
+    """, (tuple(erp_names),))
+    deleted_products = cur.rowcount
+
+    # Delete ALL images for deleted products (including manual)
+    cur.execute("""
+        DELETE FROM product_images
+        WHERE name NOT IN %s
+    """, (tuple(erp_names),))
+    deleted_images = cur.rowcount
+
+    if deleted_products > 0:
+        print(f"🗑️ Removed {deleted_products} products no longer in ERP")
+    if deleted_images > 0:
+        print(f"🗑️ Removed {deleted_images} images for deleted products")
+
     conn.commit()
     cur.close()
     release_db_connection(conn)
     print("✅ Product sync complete")
     return True
-
 
 # ─────────────────────────────────────────────
 # 📦 CACHE + ENRICHMENT
