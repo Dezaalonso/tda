@@ -868,6 +868,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://dacomstore.com",
+        "https://www.dacomstore.com",
         "https://admin.dacomstore.com",
     ],
     allow_credentials=True,
